@@ -1,0 +1,334 @@
+/*
+ * weka_zeror_iris.c
+ * ZeroR baseline + Iris dataset summary + preprocessing filters, in C.
+ *
+ * Compile: gcc -O2 -o weka_zr weka_zeror_iris.c -lm
+ * Run    : ./weka_zr iris.csv
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+
+#define MAXN 200
+#define NA   4
+#define NC   3
+
+typedef struct { int n; double x[MAXN][NA]; int y[MAXN]; } DS;
+
+static DS iris;
+static char cname[NC][24];
+static int  ncls = 0;
+static const char *aname[NA] = {"sepallength", "sepalwidth", "petallength", "petalwidth"};
+
+/* ------------------------------ loader ----------------------------------- */
+static int load_csv(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[256], lab[64];
+    while (fgets(line, sizeof line, f) && iris.n < MAXN) {
+        double v[NA];
+        if (sscanf(line, "%lf,%lf,%lf,%lf,%63[^\r\n]", &v[0], &v[1], &v[2], &v[3], lab) != 5) continue;
+        int c;
+        for (c = 0; c < ncls; c++) if (!strcmp(cname[c], lab)) break;
+        if (c == ncls) strcpy(cname[ncls++], lab);
+        for (int a = 0; a < NA; a++) iris.x[iris.n][a] = v[a];
+        iris.y[iris.n++] = c;
+    }
+    fclose(f);
+    return iris.n;
+}
+
+/* attribute statistics, ignoring missing (NaN) values; sample std dev like WEKA */
+static void attr_stats(const DS *d, int a, double *mn, double *mx, double *mean, double *sd) {
+    int k = 0; double s = 0, ss = 0;
+    *mn = DBL_MAX; *mx = -DBL_MAX;
+    for (int i = 0; i < d->n; i++) {
+        double v = d->x[i][a];
+        if (isnan(v)) continue;
+        if (v < *mn) *mn = v;
+        if (v > *mx) *mx = v;
+        s += v; k++;
+    }
+    *mean = s / k;
+    for (int i = 0; i < d->n; i++) if (!isnan(d->x[i][a])) ss += (d->x[i][a] - *mean) * (d->x[i][a] - *mean);
+    *sd = k > 1 ? sqrt(ss / (k - 1)) : 0;
+}
+
+/* ------------------------- folds and reporting --------------------------- */
+static void make_folds(const DS *d, int nf, int *fold) {
+    int perm[MAXN];
+    for (int i = 0; i < d->n; i++) perm[i] = i;
+    srand(1);
+    for (int i = d->n - 1; i > 0; i--) { int j = rand() % (i + 1); int t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+    int pos = 0;
+    for (int c = 0; c < NC; c++)
+        for (int i = 0; i < d->n; i++) if (d->y[perm[i]] == c) fold[perm[i]] = (pos++) % nf;
+}
+
+static void report(int n, int cm[NC][NC], double mae, double rmse) {
+    int ok = 0, row[NC] = {0}, col[NC] = {0};
+    for (int a = 0; a < NC; a++) for (int b = 0; b < NC; b++) { row[a] += cm[a][b]; col[b] += cm[a][b]; }
+    for (int c = 0; c < NC; c++) ok += cm[c][c];
+    double po = (double)ok / n, pe = 0;
+    for (int c = 0; c < NC; c++) pe += ((double)row[c] / n) * ((double)col[c] / n);
+    printf("Correctly Classified Instances      %4d      %8.4f %%\n", ok, 100 * po);
+    printf("Incorrectly Classified Instances    %4d      %8.4f %%\n", n - ok, 100 * (1 - po));
+    printf("Kappa statistic                     %8.4f\n", (1 - pe) > 1e-12 ? (po - pe) / (1 - pe) : 0.0);
+    if (mae >= 0) printf("Mean absolute error                 %8.4f\nRoot mean squared error             %8.4f\n", mae, rmse);
+    printf("Total Number of Instances           %4d\n\n=== Confusion Matrix ===\n\n", n);
+    printf("   a   b   c   <-- classified as\n");
+    for (int a = 0; a < NC; a++) {
+        for (int b = 0; b < NC; b++) printf("%4d", cm[a][b]);
+        printf(" | %c = %s\n", 'a' + a, cname[a]);
+    }
+}
+
+/* =============================== ZeroR ==================================== */
+typedef struct { int cls; double p[NC]; } ZR;
+
+static ZR zr_train(const DS *d, const int *idx, int m, int *cnt_out) {
+    ZR z; int cnt[NC] = {0};
+    for (int i = 0; i < m; i++) cnt[d->y[idx[i]]]++;
+    z.cls = 0;
+    for (int c = 1; c < NC; c++) if (cnt[c] > cnt[z.cls]) z.cls = c;      /* first maximum wins ties */
+    for (int c = 0; c < NC; c++) z.p[c] = (cnt[c] + 1.0) / (m + NC);       /* Laplace-smoothed prior */
+    if (cnt_out) memcpy(cnt_out, cnt, sizeof cnt);
+    return z;
+}
+
+/* returns accuracy; if verbose prints a per-fold table and the full report */
+static double zeror_cv(const DS *d, int verbose) {
+    int fold[MAXN], cm[NC][NC] = {{0}};
+    make_folds(d, 10, fold);
+    double abs_sum = 0, sq_sum = 0;
+    if (verbose) printf("%5s %22s   %s\n", "Fold", "training class counts", "ZeroR predicts");
+    for (int f = 0; f < 10; f++) {
+        int train[MAXN], nt = 0, cnt[NC];
+        for (int i = 0; i < d->n; i++) if (fold[i] != f) train[nt++] = i;
+        ZR z = zr_train(d, train, nt, cnt);
+        if (verbose) printf("%5d %10d / %d / %d   %s\n", f + 1, cnt[0], cnt[1], cnt[2], cname[z.cls]);
+        for (int i = 0; i < d->n; i++) {
+            if (fold[i] != f) continue;
+            cm[d->y[i]][z.cls]++;
+            for (int c = 0; c < NC; c++) {
+                double e = z.p[c] - (c == d->y[i] ? 1.0 : 0.0);
+                abs_sum += fabs(e); sq_sum += e * e;
+            }
+        }
+    }
+    int ok = 0;
+    for (int c = 0; c < NC; c++) ok += cm[c][c];
+    if (verbose) {
+        printf("\n=== Stratified cross-validation (10 folds) ===\n\n");
+        report(d->n, cm, abs_sum / (d->n * NC), sqrt(sq_sum / (d->n * NC)));
+    }
+    return 100.0 * ok / d->n;
+}
+
+/* ========================= preprocessing filters ========================== */
+/* Normalize: x' = (x - min) / (max - min) * scale + translation   (WEKA: scale, translation) */
+static void normalize(DS *d, double scale, double translation) {
+    for (int a = 0; a < NA; a++) {
+        double mn, mx, m, s;
+        attr_stats(d, a, &mn, &mx, &m, &s);
+        for (int i = 0; i < d->n; i++) d->x[i][a] = (d->x[i][a] - mn) / (mx - mn) * scale + translation;
+    }
+}
+/* Standardize: x' = (x - mean) / stddev */
+static void standardize(DS *d) {
+    for (int a = 0; a < NA; a++) {
+        double mn, mx, m, s;
+        attr_stats(d, a, &mn, &mx, &m, &s);
+        for (int i = 0; i < d->n; i++) d->x[i][a] = (d->x[i][a] - m) / s;
+    }
+}
+/* Discretize: equal-width bins; values replaced by bin index 0..bins-1 */
+static void discretize(DS *d, int bins) {
+    for (int a = 0; a < NA; a++) {
+        double mn, mx, m, s, w;
+        attr_stats(d, a, &mn, &mx, &m, &s);
+        w = (mx - mn) / bins;
+        for (int i = 0; i < d->n; i++) {
+            int b = (int)((d->x[i][a] - mn) / w);
+            d->x[i][a] = b >= bins ? bins - 1 : b;
+        }
+    }
+}
+/* ReplaceMissingValues: numeric missing -> attribute mean */
+static int replace_missing(DS *d) {
+    int replaced = 0;
+    for (int a = 0; a < NA; a++) {
+        double mn, mx, m, s;
+        attr_stats(d, a, &mn, &mx, &m, &s);
+        for (int i = 0; i < d->n; i++) if (isnan(d->x[i][a])) { d->x[i][a] = m; replaced++; }
+    }
+    return replaced;
+}
+
+/* ================================ OneR ==================================== */
+/* equal-width binning of the training fold, one rule per bin, best attribute */
+#define OBINS 3
+typedef struct { int attr; double mn, w; int cls[OBINS]; int correct; } OR1;
+
+static int or_bin(const OR1 *r, double v) {
+    int b = (int)((v - r->mn) / r->w);
+    return b < 0 ? 0 : (b >= OBINS ? OBINS - 1 : b);
+}
+static OR1 oner_train(const DS *d, const int *idx, int m) {
+    OR1 best; best.correct = -1;
+    for (int a = 0; a < NA; a++) {
+        OR1 r; r.attr = a;
+        double mx = -DBL_MAX; r.mn = DBL_MAX;
+        for (int i = 0; i < m; i++) { double v = d->x[idx[i]][a]; if (v < r.mn) r.mn = v; if (v > mx) mx = v; }
+        r.w = (mx - r.mn) / OBINS;
+        int cnt[OBINS][NC] = {{0}}, tot[NC] = {0};
+        for (int i = 0; i < m; i++) { cnt[or_bin(&r, d->x[idx[i]][a])][d->y[idx[i]]]++; tot[d->y[idx[i]]]++; }
+        int overall = 0;
+        for (int c = 1; c < NC; c++) if (tot[c] > tot[overall]) overall = c;
+        r.correct = 0;
+        for (int b = 0; b < OBINS; b++) {
+            int bc = overall, bn = 0, any = 0;
+            for (int c = 0; c < NC; c++) { any += cnt[b][c]; if (cnt[b][c] > bn) { bn = cnt[b][c]; bc = c; } }
+            r.cls[b] = any ? bc : overall;
+            r.correct += bn;
+        }
+        if (r.correct > best.correct) best = r;
+    }
+    return best;
+}
+static double oner_cv(const DS *d) {
+    int fold[MAXN], ok = 0;
+    make_folds(d, 10, fold);
+    for (int f = 0; f < 10; f++) {
+        int train[MAXN], nt = 0;
+        for (int i = 0; i < d->n; i++) if (fold[i] != f) train[nt++] = i;
+        OR1 r = oner_train(d, train, nt);
+        for (int i = 0; i < d->n; i++) if (fold[i] == f && r.cls[or_bin(&r, d->x[i][r.attr])] == d->y[i]) ok++;
+    }
+    return 100.0 * ok / d->n;
+}
+
+/* ================================ main ==================================== */
+static void show_row(const char *label, const DS *d, int i) {
+    printf("  %-24s", label);
+    for (int a = 0; a < NA; a++) printf("%9.4f", d->x[i][a]);
+    printf("\n");
+}
+static void show_stats(const char *label, const DS *d) {
+    printf("  %-24s", label);
+    double mn, mx, m, s;
+    for (int a = 0; a < NA; a++) { attr_stats(d, a, &mn, &mx, &m, &s); printf(" [%.2f..%.2f] m=%.2f sd=%.2f |", mn, mx, m, s); }
+    printf("\n");
+}
+
+int main(int argc, char **argv) {
+    if (!load_csv(argc > 1 ? argv[1] : "iris.csv")) { fprintf(stderr, "Cannot read iris.csv\n"); return 1; }
+    int n = iris.n;
+
+    /* ---------------- 1. dataset summary ---------------- */
+    printf("################ 1. The Iris dataset ################\n\n");
+    printf("Relation: iris   Instances: %d   Attributes: %d numeric + 1 nominal class\n\n", n, NA);
+    printf("%-14s %6s %6s %8s %8s\n", "Attribute", "Min", "Max", "Mean", "StdDev");
+    for (int a = 0; a < NA; a++) {
+        double mn, mx, m, s;
+        attr_stats(&iris, a, &mn, &mx, &m, &s);
+        printf("%-14s %6.1f %6.1f %8.3f %8.3f\n", aname[a], mn, mx, m, s);
+    }
+    int cnt[NC] = {0};
+    for (int i = 0; i < n; i++) cnt[iris.y[i]]++;
+    printf("\nClass distribution:\n");
+    for (int c = 0; c < NC; c++) printf("  %-16s %3d  %s\n", cname[c], cnt[c], cnt[c] == cnt[0] ? "" : "(unequal)");
+    printf("The classes are %s.\n", (cnt[0] == cnt[1] && cnt[1] == cnt[2]) ? "perfectly balanced (50 / 50 / 50)" : "NOT balanced");
+
+    /* ---------------- 2. ZeroR ---------------- */
+    printf("\n\n################ 2. ZeroR on iris ################\n\n");
+    int all[MAXN], fcnt[NC];
+    for (int i = 0; i < n; i++) all[i] = i;
+    ZR z = zr_train(&iris, all, n, fcnt);
+    printf("=== Classifier model (full training set) ===\n\nZeroR predicts class value: %s\n\n", cname[z.cls]);
+    printf("Class counts %d / %d / %d are tied, so the first class listed wins.\n", fcnt[0], fcnt[1], fcnt[2]);
+    printf("ZeroR never looks at sepallength, sepalwidth, petallength or petalwidth.\n\n");
+    zeror_cv(&iris, 1);
+
+    /* ---------------- 3. unbalanced classes ---------------- */
+    printf("\n\n################ 3. ZeroR when the classes are NOT balanced ################\n\n");
+    DS ub; memset(&ub, 0, sizeof ub);
+    int keep[NC] = {20, 50, 30}, got[NC] = {0};
+    for (int i = 0; i < n; i++) if (got[iris.y[i]] < keep[iris.y[i]]) { ub.x[ub.n][0] = 0; memcpy(ub.x[ub.n], iris.x[i], sizeof iris.x[i]); ub.y[ub.n++] = iris.y[i]; got[iris.y[i]]++; }
+    printf("Subsample: %d setosa, %d versicolor, %d virginica (%d instances)\n\n", keep[0], keep[1], keep[2], ub.n);
+    zeror_cv(&ub, 1);
+    printf("\nZeroR's accuracy equals the majority-class share (50/100 = 50%%): the baseline to beat.\n");
+
+    /* ---------------- 4. preprocessing ---------------- */
+    printf("\n\n################ 4. Preprocessing filters ################\n\n");
+    printf("First instance, attributes in the order %s, %s, %s, %s:\n\n", aname[0], aname[1], aname[2], aname[3]);
+    show_row("original", &iris, 0);
+
+    DS nrm01 = iris, nrm11 = iris, std = iris, disc = iris;
+    normalize(&nrm01, 1.0, 0.0);
+    normalize(&nrm11, 2.0, -1.0);
+    standardize(&std);
+    discretize(&disc, 3);
+    show_row("Normalize [0,1] (default)", &nrm01, 0);
+    show_row("Normalize [-1,+1]", &nrm11, 0);
+    show_row("Standardize", &std, 0);
+    show_row("Discretize (3 bins) index", &disc, 0);
+
+    printf("\nCheck by recomputing statistics after each filter ([min..max], mean, std dev):\n\n");
+    show_stats("Normalize [-1,+1]", &nrm11);
+    show_stats("Standardize", &std);
+    printf("\nNote: WEKA's Normalize filter scales to [0,1] by default. To get -1..+1, as your notes\n");
+    printf("describe, set scale = 2.0 and translation = -1.0 (that is what the [-1,+1] row uses).\n");
+
+    printf("\n--- Discretize: equal-width bins (3), WEKA-style intervals ---\n");
+    for (int a = 0; a < NA; a++) {
+        double mn, mx, m, s, w;
+        attr_stats(&iris, a, &mn, &mx, &m, &s);
+        w = (mx - mn) / 3;
+        int bc[3] = {0};
+        for (int i = 0; i < n; i++) bc[(int)disc.x[i][a]]++;
+        printf("  %-12s '(-inf-%.4g]' (%d)   '(%.4g-%.4g]' (%d)   '(%.4g-inf)' (%d)\n",
+               aname[a], mn + w, bc[0], mn + w, mn + 2 * w, bc[1], mn + 2 * w, bc[2]);
+    }
+
+    printf("\n--- ReplaceMissingValues (iris has none, so 3 values were blanked as a demo) ---\n");
+    DS miss = iris;
+    double orig[3] = {miss.x[0][1], miss.x[60][2], miss.x[120][3]};
+    miss.x[0][1] = NAN; miss.x[60][2] = NAN; miss.x[120][3] = NAN;
+    int r = replace_missing(&miss);
+    printf("  Replaced %d missing values with the attribute mean:\n", r);
+    printf("    instance   1, sepalwidth : was %.1f -> now %.4f\n", orig[0], miss.x[0][1]);
+    printf("    instance  61, petallength: was %.1f -> now %.4f\n", orig[1], miss.x[60][2]);
+    printf("    instance 121, petalwidth : was %.1f -> now %.4f\n", orig[2], miss.x[120][3]);
+    printf("  (This filter imputes values; it does not delete the instances.)\n");
+
+    printf("\n--- Remove attribute 2 (sepalwidth) ---\n");
+    for (int i = 0; i < 3; i++)
+        printf("  %.1f,%.1f,%.1f,%s\n", iris.x[i][0], iris.x[i][2], iris.x[i][3], cname[iris.y[i]]);
+
+    /* ---------------- 5. ZeroR vs preprocessing, OneR contrast ---------------- */
+    printf("\n\n################ 5. Does preprocessing change ZeroR? ################\n\n");
+    printf("%-30s %s\n", "ZeroR on ...", "10-fold CV accuracy");
+    printf("%-30s %9.4f %%\n", "original data", zeror_cv(&iris, 0));
+    printf("%-30s %9.4f %%\n", "Normalize [0,1]", zeror_cv(&nrm01, 0));
+    printf("%-30s %9.4f %%\n", "Normalize [-1,+1]", zeror_cv(&nrm11, 0));
+    printf("%-30s %9.4f %%\n", "Standardize", zeror_cv(&std, 0));
+    printf("%-30s %9.4f %%\n", "Discretize (3 bins)", zeror_cv(&disc, 0));
+    printf("\nIdentical every time: ZeroR ignores the attributes, so no filter can help it.\n");
+
+    printf("\n--- Contrast: OneR (one-attribute rule on 3 equal-width bins) ---\n");
+    OR1 rule = oner_train(&iris, all, n);
+    printf("Best single attribute on the full data: %s  (%d/%d correct on training data)\n", aname[rule.attr], rule.correct, n);
+    for (int b = 0; b < OBINS; b++) {
+        if (b == 0) printf("  < %.3f", rule.mn + rule.w);
+        else if (b == OBINS - 1) printf("  >= %.3f", rule.mn + b * rule.w);
+        else printf("  %.3f to %.3f", rule.mn + b * rule.w, rule.mn + (b + 1) * rule.w);
+        printf(" -> %s\n", cname[rule.cls[b]]);
+    }
+    double oacc = oner_cv(&iris);
+    printf("\n%-30s %9.4f %%\n%-30s %9.4f %%\n", "ZeroR (baseline)", zeror_cv(&iris, 0), "OneR, 10-fold CV", oacc);
+    printf("A useful classifier must beat the baseline; OneR does so by %.2f points using one attribute.\n", oacc - zeror_cv(&iris, 0));
+    return 0;
+}
